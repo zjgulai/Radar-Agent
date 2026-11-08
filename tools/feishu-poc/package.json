@@ -1,0 +1,16 @@
+{
+  "name": "feishu-poc",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Receive-only Feishu PoC with pinned official SDK and bounded local runtime",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.76.0"
+  }
+}
