@@ -13,10 +13,11 @@
 | discovery ClientConfig 未校验，零值/NaN可能使SDK计时器及重试高频运行 | C：独立源码检查与合成复现支持；不是已发生的线上事故 | 修复：校验整数范围，拒绝缺字段/异常值，避免计时器溢出与热循环 |
 | SDK close无法触达尚未open的局部握手socket与计时器 | B：固定SDK源码局限；C：合成子进程复现 | 修复：CLI终态flush并退出自身进程，设置不超过2秒兜底；保留close/abort，不停止其他client |
 | 启动20秒等于discovery10秒加握手10秒，无调度余量 | C：合成边界复现；未观测真实平台超时 | 修复：启动25秒；父启动预算同步25秒，总时限duration+35秒 |
+| 晚fatal可能在stopped后追加failed，但退出码仍0 | C：同一复核者续问的合成子进程复现 | 并入退出修复：统一终态，不输出相互矛盾的末行与退出码 |
 | handler返回值被丢弃；异常可能被无诊断地ACK为成功 | 当前空对象回调与内核返回一致；未来非空toast/card传播不属本PoC | 保留固定`{}`不扩展业务输出；仅修当前失败诊断，输出固定handler_error，不回显异常 |
 | malformed bot/card通过展平wrapper后仍可能被记received | C：真实EventDispatcher的合成复现支持；计数不是事件schema完整校验 | 修复：仅验证必要字段存在性，不读取人员/群/卡/action/body值，补集成断言 |
 | WSS只校验scheme与userinfo，未限制目标host/port | C：防御加固；需要可信官方discovery被破坏才可利用，不是已发生的SSRF | 本地fail-closed工程策略：仅feishu.cn域名族、默认或443端口；不把该策略称官方全部域名目录；不合策略时不放宽到任意host |
-| “single discovery call”注释不准确，重连会重复discovery | 不是当前独立缺陷，重复请求属于重连机制 | 改为每次尝试有界；不声称仅一次凭证POST |
+| “single discovery call”注释不准确，重连会重复discovery | 重复请求属于重连机制；不能声称仅一次秘密传输 | 改为每次尝试有界，并补每运行最多32次、间隔至少1秒的fail-closed预算；不静默无限重试 |
 | README仍写8192字节 | 旧复核快照发现 | 父助手已更新为32768字节，与Secret自身4096 UTF-8字节校验区分 |
 
 ## 测试校准与已知限制

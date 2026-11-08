@@ -441,9 +441,9 @@ test('bot added handler counts its delivery and returns undefined', () => {
 
 test('card action handler returns an empty PoC acknowledgement without reading action content', () => {
   const { handlers, snapshot, lines, records } = createHandlerHarness();
-  const payload = {};
-  for (const name of ['action', 'value']) {
-    Object.defineProperty(payload, name, {
+  const payload = { event: {} };
+  for (const name of ['token', 'action', 'context']) {
+    Object.defineProperty(payload.event, name, {
       enumerable: true,
       get() {
         throw new Error('MARKER_ACTION_READ');
@@ -473,6 +473,94 @@ test('card action handler returns an empty PoC acknowledgement without reading a
   assert.equal('card' in record, false);
   assert.equal('action' in record, false);
   assert.equal(lines.join('').includes('MARKER'), false);
+});
+
+test('bot and card deliveries with structurally missing fields are invalid', () => {
+  const { handlers, snapshot, records } = createHandlerHarness();
+
+  const botBodies = [
+    {},
+    { event: {} },
+    { event: { chat_id: 'MARKER_CHAT_ID' } },
+    { event: { operator_id: { open_id: 'MARKER_OPERATOR' } } },
+  ];
+  for (const body of botBodies) {
+    assert.equal(handlers['im.chat.member.bot.added_v1'](body), undefined);
+  }
+
+  const cardBodies = [
+    {},
+    { event: {} },
+    { event: { action: { value: 'MARKER_ACTION' } } },
+    { event: { token: 'MARKER_TOKEN' } },
+  ];
+  for (const body of cardBodies) {
+    assert.deepEqual(handlers['card.action.trigger'](body), {});
+  }
+
+  assert.deepEqual(snapshot(), {
+    total: 8,
+    invalid: 8,
+    byEvent: {
+      'im.message.receive_v1': 0,
+      'im.chat.member.bot.added_v1': 4,
+      'card.action.trigger': 4,
+    },
+    byChatType: { p2p: 0, group: 0, unknown: 0 },
+  });
+  for (const record of records()) {
+    assert.equal(record.status, 'invalid');
+    assert.equal(record.error, 'invalid_payload');
+  }
+});
+
+test('bot and card deliveries with the structural fields present are valid without reading values', () => {
+  const { handlers, snapshot } = createHandlerHarness();
+
+  const bot = { event: {} };
+  for (const name of ['chat_id', 'operator_id']) {
+    Object.defineProperty(bot.event, name, {
+      enumerable: true,
+      get() {
+        throw new Error('MARKER_BOT_FIELD_READ');
+      },
+    });
+  }
+  assert.equal(handlers['im.chat.member.bot.added_v1'](bot), undefined);
+
+  const card = { event: {} };
+  for (const name of ['token', 'action']) {
+    Object.defineProperty(card.event, name, {
+      enumerable: true,
+      get() {
+        throw new Error('MARKER_CARD_FIELD_READ');
+      },
+    });
+  }
+  assert.deepEqual(handlers['card.action.trigger'](card), {});
+
+  assert.deepEqual(snapshot(), {
+    total: 2,
+    invalid: 0,
+    byEvent: {
+      'im.message.receive_v1': 0,
+      'im.chat.member.bot.added_v1': 1,
+      'card.action.trigger': 1,
+    },
+    byChatType: { p2p: 0, group: 0, unknown: 0 },
+  });
+});
+
+test('createAudit allowlists the fixed handler_error diagnostic', () => {
+  const { audit, records } = captureAudit();
+
+  audit({ event: 'im.message.receive_v1', status: 'invalid', error: 'handler_error' });
+
+  const [record] = records();
+  assert.equal(record.event, 'im.message.receive_v1');
+  assert.equal(record.status, 'invalid');
+  assert.equal(record.error, 'handler_error');
+  assert.match(record.requestId, /^req-[1-9][0-9]*$/);
 });
 
 test('invalid payloads never throw and emit only fixed audit codes', () => {
@@ -542,7 +630,7 @@ test('handler timing uses the injected clock and omits nonsensical elapsed value
   const { handlers, records } = createHandlerHarness({ now: clock });
 
   handlers['im.message.receive_v1']({ event: { message: { chat_type: 'p2p' } } });
-  handlers['card.action.trigger']({});
+  handlers['card.action.trigger']({ event: { action: {}, token: 'synthetic-token' } });
 
   const [messageRecord, cardRecord] = records();
   assert.equal(messageRecord.durationMs, 7);

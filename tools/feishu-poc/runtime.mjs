@@ -1,13 +1,21 @@
+import { isIP } from 'node:net';
+
 import * as defaultSdk from '@larksuiteoapi/node-sdk';
 
 import { createAudit, createHandlers } from './core.mjs';
 
 export const DISCOVERY_URL = 'https://open.feishu.cn/callback/ws/endpoint';
-export const STARTUP_DEADLINE_MS = 20000;
+// Discovery (10s) and handshake (10s) can run back to back before onReady, so
+// the startup deadline keeps a 5s scheduling margin above that sum.
+export const STARTUP_DEADLINE_MS = 25000;
 export const HANDSHAKE_TIMEOUT_MS = 10000;
 export const SNAPSHOT_INTERVAL_MS = 15000;
 export const MAX_DISCOVERY_TIMEOUT_MS = 10000;
 export const MAX_DISCOVERY_RESPONSE_BYTES = 64 * 1024;
+// Fail-closed discovery budget: reconnects repeat discovery per attempt, so
+// cap the run and refuse attempts that arrive inside the one-second floor.
+export const MAX_DISCOVERY_ATTEMPTS = 32;
+export const MIN_DISCOVERY_INTERVAL_MS = 1000;
 const MAX_DISCOVERY_CODE = Number.MAX_SAFE_INTEGER;
 const MAX_DURATION_MS = 600 * 1000;
 const MAX_SECRET_BYTES = 4096;
@@ -69,10 +77,59 @@ function isAllowedWssUrl(value) {
   } catch {
     return false;
   }
-  return parsed.protocol === 'wss:'
-    && parsed.username === ''
-    && parsed.password === ''
-    && parsed.hostname.length > 0;
+  if (parsed.protocol !== 'wss:'
+    || parsed.username !== ''
+    || parsed.password !== ''
+    || parsed.hostname.length === 0) {
+    return false;
+  }
+  // Local engineering policy: stay inside the Feishu domain family on the
+  // default/443 port, with no userinfo and no IP literals. This is not a
+  // claim that every official endpoint host lives here.
+  if (parsed.port !== '' && parsed.port !== '443') {
+    return false;
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (isIP(hostname) !== 0) {
+    return false;
+  }
+  return hostname === 'feishu.cn' || hostname.endsWith('.feishu.cn');
+}
+
+function boundedClientInteger(value, minimum, maximum) {
+  return Number.isInteger(value) && value >= minimum && value <= maximum;
+}
+
+function normalizeClientConfig(value) {
+  // The SDK multiplies each field by 1000 and feeds setTimeout. Missing,
+  // zero, fractional, or non-finite values become NaN/0ms timers and can spin
+  // the reconnect/ping loops, so every timer must be a bounded integer second.
+  try {
+    if (!isRecord(value)) {
+      throw rejectionError();
+    }
+
+    const pingInterval = value.PingInterval;
+    const reconnectInterval = value.ReconnectInterval;
+    const reconnectNonce = value.ReconnectNonce;
+    const reconnectCount = value.ReconnectCount;
+
+    if (!boundedClientInteger(pingInterval, 1, 3600)
+      || !boundedClientInteger(reconnectInterval, 1, 3600)
+      || !boundedClientInteger(reconnectNonce, 0, 3600)
+      || !(reconnectCount === -1 || boundedClientInteger(reconnectCount, 0, 100))) {
+      throw rejectionError();
+    }
+
+    return {
+      PingInterval: pingInterval,
+      ReconnectInterval: reconnectInterval,
+      ReconnectNonce: reconnectNonce,
+      ReconnectCount: reconnectCount,
+    };
+  } catch {
+    throw rejectionError();
+  }
 }
 
 function boundedTime(value, fallback, maximum) {
@@ -100,10 +157,12 @@ export function createSdkLogger() {
 /**
  * Wrap the SDK's endpoint-discovery HTTP instance. The SDK calls
  * httpInstance.request({ method:'post', url, data:{AppID,AppSecret}, ... })
- * and expects decoded { code, data, msg }. The wrapper enforces the single
- * allowed discovery call, binds the body to the explicit config, bounds
- * timeout/response size/redirects, and denies any response that lands after
- * the AbortController fires.
+ * once for the initial connect and again for every reconnect attempt. Each
+ * call is independent and bounded: the wrapper binds the body to the explicit
+ * config, bounds timeout/response size/redirects, validates the WSS URL and
+ * ClientConfig, and denies any response that lands after the AbortController
+ * fires. It also fails closed beyond 32 attempts per run and refuses attempts
+ * inside the one-second floor; it never sleeps or silently retries.
  */
 export function createGuardedHttpInstance({
   appId,
@@ -111,7 +170,12 @@ export function createGuardedHttpInstance({
   request,
   record = () => {},
   signal,
+  now = Date.now,
 }) {
+  const clock = typeof now === 'function' ? now : Date.now;
+  let discoveryAttempts = 0;
+  let lastDiscoveryAttemptAt;
+
   async function guardedRequest(options) {
     if (signal !== undefined && signal.aborted) {
       throw abortError();
@@ -144,6 +208,7 @@ export function createGuardedHttpInstance({
       data: { AppID: appId, AppSecret: appSecret },
       maxRedirects: 0,
       maxContentLength: MAX_DISCOVERY_RESPONSE_BYTES,
+      proxy: false,
       timeout: Math.min(Math.max(requestedTimeout, 1), MAX_DISCOVERY_TIMEOUT_MS),
     };
     if (signal !== undefined) {
@@ -154,6 +219,25 @@ export function createGuardedHttpInstance({
     if (typeof request !== 'function') {
       throw rejectionError();
     }
+
+    if (discoveryAttempts >= MAX_DISCOVERY_ATTEMPTS) {
+      throw rejectionError();
+    }
+    let attemptedAt;
+    try {
+      attemptedAt = clock();
+    } catch {
+      throw rejectionError();
+    }
+    if (!Number.isFinite(attemptedAt)) {
+      throw rejectionError();
+    }
+    if (lastDiscoveryAttemptAt !== undefined
+      && attemptedAt - lastDiscoveryAttemptAt < MIN_DISCOVERY_INTERVAL_MS) {
+      throw rejectionError();
+    }
+    discoveryAttempts += 1;
+    lastDiscoveryAttemptAt = attemptedAt;
 
     let response;
     try {
@@ -209,11 +293,21 @@ export function createGuardedHttpInstance({
     }
 
     const data = response.data;
-    if (!isRecord(data) || !isAllowedWssUrl(data.URL)) {
+    if (!isRecord(data)) {
       throw rejectionError();
     }
+    let url;
+    try {
+      url = data.URL;
+    } catch {
+      throw rejectionError();
+    }
+    if (!isAllowedWssUrl(url)) {
+      throw rejectionError();
+    }
+    const clientConfig = normalizeClientConfig(data.ClientConfig);
 
-    return { code: 0, data };
+    return { code: 0, data: { URL: url, ClientConfig: clientConfig } };
   }
 
   return { request: guardedRequest };
@@ -291,6 +385,13 @@ export function createRuntime({ config, sdk = defaultSdk, writeLine, timing = {}
 
   const audit = createAudit(safeWriteLine);
   const { handlers, snapshot } = createHandlers({ audit });
+  const recordHandlerFailure = (eventType) => {
+    try {
+      audit({ event: eventType, status: 'invalid', error: 'handler_error' });
+    } catch {
+      // Fixed failure diagnostics must never escape an SDK callback either.
+    }
+  };
   const logger = createSdkLogger();
   const controller = new AbortController();
 
@@ -316,7 +417,8 @@ export function createRuntime({ config, sdk = defaultSdk, writeLine, timing = {}
     try {
       handlers[eventType]({ event: data });
     } catch {
-      // Never let handler code throw into the SDK.
+      // Explicit invalid diagnostic; raw thrown values never reach output.
+      recordHandlerFailure(eventType);
     }
     return undefined;
   };
@@ -328,7 +430,8 @@ export function createRuntime({ config, sdk = defaultSdk, writeLine, timing = {}
       try {
         handlers['card.action.trigger']({ event: data });
       } catch {
-        // Keep the acknowledgement contract even on malformed input.
+        // Keep the acknowledgement contract even when the handler fails.
+        recordHandlerFailure('card.action.trigger');
       }
       return {};
     },
@@ -430,6 +533,8 @@ export function createRuntime({ config, sdk = defaultSdk, writeLine, timing = {}
     });
   }
 
+  // SDK onReady means the WebSocket opened (WS open), not that application
+  // protocol readiness, event subscription, or delivery was verified.
   function onReady() {
     try {
       if (finished || connected) {

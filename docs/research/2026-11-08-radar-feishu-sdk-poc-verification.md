@@ -80,7 +80,7 @@ const {
 | `connectionHeaders` | `Record<string,string>?` | 握手专用头；构造时复制。`Host`、`Connection`、`Upgrade`、`Sec-WebSocket-*` 抛 `ConnectionConfigError`；其余头不做格式校验（`102357-102367`）。不会转发给 endpoint discovery。 |
 | `source` | `string?` | 追加到 User-Agent，格式 `source/<name>`。 |
 | `extraUaTags` | `string[]?` | 内部用，追加裸 token。 |
-| `onReady` | `() => void` | 首次握手成功后调用（start 成功路径每次都调用；重连循环中仅当从未连过才调用）。 |
+| `onReady` | `() => void` | SDK观察到WebSocket `open`后调用（start成功路径每次都调用；重连循环中仅当从未连过才调用）。不是应用层handshake-status、订阅或事件投递确认。 |
 | `onError` | `(err: Error) => void` | 仅在不可重试的初始失败、`autoReconnect=false` 的初始失败、重连次数耗尽/不可重试时调用。 |
 | `onReconnecting` | `() => void` | 进入自动重连循环且曾经连过时调用。 |
 | `onReconnected` | `() => void` | 自动重连成功且曾经连过时调用。 |
@@ -442,7 +442,7 @@ this.sendMessage({
   - body：`{ AppID, AppSecret }`；ClientAssertion 模式为 `{ AppID, AppSecret:'', ClientAssertion }`，可加 `X-Target-Service`（`102565-102583`）。
   - timeout：`15000` ms（`102584-102590`）。
   - 期望响应：`{ code:0, data:{ URL, ClientConfig:{ PingInterval, ReconnectCount, ReconnectInterval, ReconnectNonce } }, msg }`；`URL` 的 query 中取 `device_id/service_id`；`ClientConfig` 数值单位是秒（`102591-102612`）。
-  - 非 0 code：`1 system_busy` 与 `1000040343 internal_error` 可重试；其余（如 `514 auth_failed`、`403 forbidden`、`1000040350 exceed_conn_limit`）不可重试，`onError`（`102591-102601`）。
+  - 非 0 code：仅`1000040343 internal_error`在该固定版本分支中标为可重试；`1 system_busy`只更换错误描述，仍不可重试。其他（如 `514 auth_failed`、`403 forbidden`、`1000040350 exceed_conn_limit`）亦不可重试并触发终态错误（`102591-102601`）。此为2026-11-08父助手按安装源码再次核对后的修正。
 - WS 连接：`new WebSocket(connectUrl, { agent, headers? })`（`102626-102635`）。
 - **SDK 没有校验 `wss:`**：`buildConnectionUrl` 的正则是 `/^(wss?):\/\/([^/?#]+)([^#]*)$/`，保留原 scheme；无 `connectionHost` 时直接返回 endpoint；有 `connectionHost` 时只替换 authority（`102368-102381`）。如果 discovery 返回 `ws://`，SDK 会按明文 WS 连接；如果返回 `wss://`，`ws` 库按 TLS 连接。`connectionHeaders` 只影响 HTTP Upgrade 握手，不改变 scheme；`agent` 可覆盖 TLS 行为（C：自定义 agent 必须自行保证证书校验）。
 - 官方规则（B）：

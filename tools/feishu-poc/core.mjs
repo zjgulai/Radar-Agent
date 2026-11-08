@@ -8,7 +8,7 @@ const AUDIT_EVENT_TYPES = new Set([
   'card.action.trigger',
 ]);
 const AUDIT_STATUS_CODES = new Set(['received', 'invalid']);
-const AUDIT_ERROR_CODES = new Set(['invalid_payload']);
+const AUDIT_ERROR_CODES = new Set(['invalid_payload', 'handler_error']);
 const AUDIT_CHAT_TYPES = new Set(['p2p', 'group', 'unknown']);
 
 function isNonNegativeSafeInteger(value) {
@@ -122,6 +122,14 @@ function readProperty(value, key) {
   }
 }
 
+function hasOwn(value, key) {
+  try {
+    return isRecord(value) && Object.hasOwn(value, key);
+  } catch {
+    return false;
+  }
+}
+
 function readChatType(payload) {
   const event = readProperty(payload, 'event');
   const message = readProperty(event, 'message');
@@ -135,7 +143,13 @@ function isMessageDelivery(payload) {
 }
 
 function isBotAddedDelivery(payload) {
-  return isRecord(readProperty(payload, 'event'));
+  const event = readProperty(payload, 'event');
+  return hasOwn(event, 'chat_id') && hasOwn(event, 'operator_id');
+}
+
+function isCardActionDelivery(payload) {
+  const event = readProperty(payload, 'event');
+  return hasOwn(event, 'action') && hasOwn(event, 'token');
 }
 
 export function createHandlers({ audit, now = Date.now } = {}) {
@@ -209,7 +223,7 @@ export function createHandlers({ audit, now = Date.now } = {}) {
   function handleCardAction(payload) {
     const startedAt = begin(EVENT_CARD_ACTION);
 
-    if (!isRecord(payload)) {
+    if (!isCardActionDelivery(payload)) {
       recordInvalid(EVENT_CARD_ACTION);
       return {};
     }

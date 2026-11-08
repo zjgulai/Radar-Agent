@@ -7,6 +7,7 @@ import * as sdk from '@larksuiteoapi/node-sdk';
 import { TARGET_APP_ID, parseConfig } from '../core.mjs';
 import {
   HANDSHAKE_TIMEOUT_MS,
+  MAX_DISCOVERY_TIMEOUT_MS,
   STARTUP_DEADLINE_MS,
   createRuntime,
 } from '../runtime.mjs';
@@ -14,6 +15,15 @@ import {
 const APP_SECRET = '{{SECRET_od3qvz6r}}';
 const CONFIG = parseConfig({ appId: TARGET_APP_ID, appSecret: APP_SECRET, durationSeconds: 300 });
 const RUN_PATH = fileURLToPath(new URL('../run.mjs', import.meta.url));
+const UNCANCELLABLE_PRELOAD = fileURLToPath(
+  new URL('./fixtures/uncancellable-handshake-preload.mjs', import.meta.url),
+);
+const BLOCKED_STDOUT_PRELOAD = fileURLToPath(
+  new URL('./fixtures/blocked-stdout-preload.mjs', import.meta.url),
+);
+const LATE_FATAL_PRELOAD = fileURLToPath(
+  new URL('./fixtures/late-fatal-preload.mjs', import.meta.url),
+);
 const ENDPOINT = 'https://open.feishu.cn/callback/ws/endpoint';
 const WSS_URL = 'wss://open.feishu.cn/ws?device_id=synthetic-device&service_id=synthetic-service';
 const CLIENT_CONFIG = {
@@ -82,7 +92,7 @@ function discoveryOptions(options) {
   };
 }
 
-function createHarness({ mode = 'manual', discovery } = {}) {
+function createHarness({ mode = 'manual', discovery, readyDelayMs = 30 } = {}) {
   const lines = [];
   const calls = {
     requests: [],
@@ -151,7 +161,7 @@ function createHarness({ mode = 'manual', discovery } = {}) {
             calls.discoveryRejected = true;
             return;
           }
-          await new Promise((resolve) => setTimeout(resolve, 30));
+          await new Promise((resolve) => setTimeout(resolve, readyDelayMs));
           options.onReady();
         })();
       }
@@ -240,8 +250,8 @@ function createHarness({ mode = 'manual', discovery } = {}) {
   };
 }
 
-function createTestRuntime({ mode = 'manual', discovery, timing, writeLine } = {}) {
-  const harness = createHarness({ mode, discovery });
+function createTestRuntime({ mode = 'manual', discovery, readyDelayMs, timing, writeLine } = {}) {
+  const harness = createHarness({ mode, discovery, readyDelayMs });
   const runtime = createRuntime({
     config: CONFIG,
     sdk: harness.sdk,
@@ -271,9 +281,13 @@ function invoke(dispatcher, eventType, event) {
   );
 }
 
-test('runtime pins the verified handshake and startup defaults', () => {
+test('runtime pins the verified handshake and startup defaults with margin', () => {
   assert.equal(HANDSHAKE_TIMEOUT_MS, 10000);
-  assert.equal(STARTUP_DEADLINE_MS, 20000);
+  assert.equal(STARTUP_DEADLINE_MS, 25000);
+  assert.equal(
+    STARTUP_DEADLINE_MS - MAX_DISCOVERY_TIMEOUT_MS - HANDSHAKE_TIMEOUT_MS,
+    5000,
+  );
 });
 
 test('runtime constructs WSClient with the exact receive-only option set', () => {
@@ -483,6 +497,23 @@ test('the duration clock starts after onReady, not after start resolves', async 
 
   assert.deepEqual(result, { outcome: 'stopped', exitCode: 0, connected: true });
   assert.ok(elapsed >= 35 && elapsed < 1000, `elapsed ${elapsed}`);
+  assert.deepEqual(records().map((record) => record.status), ['connected', 'stopped']);
+});
+
+test('a delayed ready scaled to the startup margin still connects before the deadline', async () => {
+  const startupMarginMs = STARTUP_DEADLINE_MS - MAX_DISCOVERY_TIMEOUT_MS - HANDSHAKE_TIMEOUT_MS;
+  const readyDelayMs = startupMarginMs / 100;
+  const startupDeadlineMs = startupMarginMs / 50;
+
+  const { runtime, records } = createTestRuntime({
+    mode: 'delayed-ready',
+    readyDelayMs,
+    timing: { startupDeadlineMs, durationMs: 20 },
+  });
+
+  const result = await runtime.start();
+
+  assert.deepEqual(result, { outcome: 'stopped', exitCode: 0, connected: true });
   assert.deepEqual(records().map((record) => record.status), ['connected', 'stopped']);
 });
 
@@ -711,6 +742,51 @@ test('a throwing writeLine never escapes runtime callbacks', async () => {
   assert.deepEqual(result, { outcome: 'stopped', exitCode: 0, connected: true });
 });
 
+test('caught handler failures emit fixed handler_error metadata and keep card output {}', async () => {
+  const realNow = Date.now;
+  Date.now = () => {
+    throw new Error('MARKER_HANDLER_FAILURE');
+  };
+
+  let harness;
+  try {
+    harness = createTestRuntime({
+      mode: 'manual',
+      timing: { startupDeadlineMs: 500, durationMs: 500 },
+    });
+  } finally {
+    Date.now = realNow;
+  }
+
+  const { runtime, calls, records, lines } = harness;
+  const done = runtime.start();
+  const dispatcher = calls.starts[0].eventDispatcher;
+  const messageCallback = dispatcher.handles.get('im.message.receive_v1');
+  const cardCallback = dispatcher.handles.get('card.action.trigger');
+
+  assert.equal(messageCallback({ message: { chat_type: 'p2p' } }), undefined);
+  assert.deepEqual(
+    cardCallback({ token: 'MARKER_TOKEN', action: { value: 'MARKER_ACTION' }, context: {} }),
+    {},
+  );
+
+  const diagnostics = records().filter((record) => record.error === 'handler_error');
+  assert.equal(diagnostics.length, 2);
+  for (const diagnostic of diagnostics) {
+    assert.deepEqual(Object.keys(diagnostic).sort(), ['error', 'event', 'requestId', 'status']);
+    assert.equal(diagnostic.status, 'invalid');
+    assert.equal(diagnostic.error, 'handler_error');
+  }
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => diagnostic.event),
+    ['im.message.receive_v1', 'card.action.trigger'],
+  );
+  assert.equal(lines.join('').includes('MARKER'), false);
+
+  runtime.stop('signal');
+  await done;
+});
+
 test('run.mjs fails closed on empty stdin with a constant safe line', () => {
   const result = spawnSync(process.execPath, [RUN_PATH], {
     input: '',
@@ -793,3 +869,130 @@ for (const signalName of ['SIGINT', 'SIGTERM']) {
     assert.equal(stdout, '{"status":"stopped","reason":"signal"}\n');
   });
 }
+
+function runRunMjsWithPreload(preload, input, timeoutMs = 6000) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const child = spawn(process.execPath, ['--import', preload, RUN_PATH], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('run.mjs did not exit after its terminal result'));
+    }, timeoutMs);
+    timer.unref();
+
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr, elapsed: Date.now() - startedAt });
+    });
+
+    child.stdin.end(input);
+  });
+}
+
+const VALID_STDIN = JSON.stringify({
+  appId: TARGET_APP_ID,
+  appSecret: APP_SECRET,
+  durationSeconds: 10,
+});
+
+test('run.mjs exits its own process after a terminal result despite an uncancellable handshake timer', async () => {
+  const exit = await runRunMjsWithPreload(UNCANCELLABLE_PRELOAD, VALID_STDIN);
+
+  assert.equal(exit.signal, null);
+  assert.equal(exit.code, 1);
+  assert.equal(exit.stderr, '');
+  assert.equal(exit.stdout, '{"status":"failed","error":"sdk_error"}\n');
+  assert.ok(exit.elapsed < 5000, `elapsed ${exit.elapsed}`);
+});
+
+test('run.mjs enforces the flush fallback when stdout never completes', async () => {
+  const exit = await runRunMjsWithPreload(BLOCKED_STDOUT_PRELOAD, VALID_STDIN);
+
+  assert.equal(exit.signal, null);
+  assert.equal(exit.code, 1);
+  assert.equal(exit.stderr, '');
+  assert.ok(exit.elapsed >= 1500, `exited before the fallback window: ${exit.elapsed}`);
+  assert.ok(exit.elapsed < 5000, `elapsed ${exit.elapsed}`);
+});
+
+function runRunMjsWithPreloadUntilSignal(preload, input, marker, signalName, timeoutMs = 6000) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const child = spawn(process.execPath, ['--import', preload, RUN_PATH], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`run.mjs did not exit after ${marker}`));
+    }, timeoutMs);
+    timer.unref();
+
+    const poll = setInterval(() => {
+      if (stdout.includes(marker)) {
+        clearInterval(poll);
+        child.kill(signalName);
+      }
+    }, 5);
+    poll.unref();
+
+    child.once('error', (error) => {
+      clearInterval(poll);
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('exit', (code, signal) => {
+      clearInterval(poll);
+      clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr, elapsed: Date.now() - startedAt });
+    });
+
+    child.stdin.end(input);
+  });
+}
+
+test('a late uncaught exception after stopped keeps one terminal record and exit 0', async () => {
+  const exit = await runRunMjsWithPreloadUntilSignal(
+    LATE_FATAL_PRELOAD,
+    VALID_STDIN,
+    '"status":"connected"',
+    'SIGTERM',
+  );
+
+  assert.equal(exit.signal, null);
+  assert.equal(exit.code, 0);
+  assert.equal(exit.stderr, '');
+  const terminalLines = exit.stdout
+    .split('\n')
+    .filter((line) => line.includes('"status":"stopped"') || line.includes('"status":"failed"'));
+  assert.deepEqual(terminalLines, ['{"status":"stopped","reason":"signal"}']);
+  assert.equal(exit.stdout.includes('"status":"failed"'), false);
+  assert.ok(exit.elapsed < 3000, `elapsed ${exit.elapsed}`);
+});

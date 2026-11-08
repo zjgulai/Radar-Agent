@@ -4,8 +4,10 @@ import assert from 'node:assert/strict';
 import {
   DISCOVERY_URL,
   HANDSHAKE_TIMEOUT_MS,
+  MAX_DISCOVERY_ATTEMPTS,
   MAX_DISCOVERY_RESPONSE_BYTES,
   MAX_DISCOVERY_TIMEOUT_MS,
+  MIN_DISCOVERY_INTERVAL_MS,
   SNAPSHOT_INTERVAL_MS,
   STARTUP_DEADLINE_MS,
   createGuardedHttpInstance,
@@ -41,7 +43,7 @@ function discoveryOptions(overrides = {}) {
   };
 }
 
-function createGuard({ response = validResponse } = {}) {
+function createGuard({ response = validResponse, now } = {}) {
   const calls = [];
   const records = [];
   const controller = new AbortController();
@@ -54,16 +56,28 @@ function createGuard({ response = validResponse } = {}) {
     },
     record: (record) => records.push(record),
     signal: controller.signal,
+    ...(now === undefined ? {} : { now }),
   });
   return { guard, calls, records, controller };
 }
 
-test('pinned runtime timing constants are the verified values', () => {
-  assert.equal(STARTUP_DEADLINE_MS, 20000);
+function fixedRejection(error) {
+  assert.equal(error.message, 'discovery_rejected');
+  assert.equal(error.message.includes('MARKER'), false);
+  return true;
+}
+
+test('pinned runtime timing constants are the verified values with startup margin', () => {
+  assert.equal(STARTUP_DEADLINE_MS, 25000);
   assert.equal(HANDSHAKE_TIMEOUT_MS, 10000);
   assert.equal(MAX_DISCOVERY_TIMEOUT_MS, 10000);
   assert.equal(SNAPSHOT_INTERVAL_MS, 15000);
   assert.equal(MAX_DISCOVERY_RESPONSE_BYTES, 65536);
+  // Discovery and handshake run back to back inside the startup deadline.
+  assert.equal(
+    STARTUP_DEADLINE_MS - MAX_DISCOVERY_TIMEOUT_MS - HANDSHAKE_TIMEOUT_MS,
+    5000,
+  );
 });
 
 test('SDK logger implements exactly the five methods and discards all arguments', () => {
@@ -97,6 +111,7 @@ test('guard forwards one bounded POST discovery request and preserves ClientConf
   assert.equal(sent.method, 'post');
   assert.equal(sent.url, DISCOVERY_URL);
   assert.equal(sent.maxRedirects, 0);
+  assert.equal(sent.proxy, false);
   assert.equal(sent.timeout, 10000);
   assert.equal(sent.maxContentLength, 65536);
   assert.equal(sent.signal instanceof AbortSignal, true);
@@ -125,6 +140,215 @@ test('guard accepts an explicit POST spelling and a shorter timeout without exce
 
   assert.equal(result.code, 0);
   assert.equal(calls[0].timeout, 2500);
+});
+
+test('guard requires a ClientConfig record with every timer bounded to integer seconds', async () => {
+  const invalidConfigs = [
+    ['missing ClientConfig', undefined],
+    ['null ClientConfig', null],
+    ['array ClientConfig', []],
+    ['string ClientConfig', 'config'],
+    ['numeric ClientConfig', 42],
+    ['empty ClientConfig', {}],
+    ['zero PingInterval', { ...CLIENT_CONFIG, PingInterval: 0 }],
+    ['oversized PingInterval', { ...CLIENT_CONFIG, PingInterval: 3601 }],
+    ['fractional PingInterval', { ...CLIENT_CONFIG, PingInterval: 1.5 }],
+    ['negative PingInterval', { ...CLIENT_CONFIG, PingInterval: -1 }],
+    ['string PingInterval', { ...CLIENT_CONFIG, PingInterval: '120' }],
+    ['NaN PingInterval', { ...CLIENT_CONFIG, PingInterval: NaN }],
+    ['zero ReconnectInterval', { ...CLIENT_CONFIG, ReconnectInterval: 0 }],
+    ['oversized ReconnectInterval', { ...CLIENT_CONFIG, ReconnectInterval: 3601 }],
+    ['fractional ReconnectInterval', { ...CLIENT_CONFIG, ReconnectInterval: 1.5 }],
+    ['negative ReconnectInterval', { ...CLIENT_CONFIG, ReconnectInterval: -1 }],
+    ['string ReconnectInterval', { ...CLIENT_CONFIG, ReconnectInterval: '120' }],
+    ['negative ReconnectNonce', { ...CLIENT_CONFIG, ReconnectNonce: -1 }],
+    ['oversized ReconnectNonce', { ...CLIENT_CONFIG, ReconnectNonce: 3601 }],
+    ['fractional ReconnectNonce', { ...CLIENT_CONFIG, ReconnectNonce: 1.5 }],
+    ['string ReconnectNonce', { ...CLIENT_CONFIG, ReconnectNonce: '30' }],
+    ['too-small ReconnectCount', { ...CLIENT_CONFIG, ReconnectCount: -2 }],
+    ['oversized ReconnectCount', { ...CLIENT_CONFIG, ReconnectCount: 101 }],
+    ['fractional ReconnectCount', { ...CLIENT_CONFIG, ReconnectCount: 1.5 }],
+    ['string ReconnectCount', { ...CLIENT_CONFIG, ReconnectCount: '1' }],
+  ];
+
+  for (const [name, clientConfig] of invalidConfigs) {
+    const { guard, calls, records } = createGuard({
+      response: {
+        code: 0,
+        data: { URL: WSS_URL, ClientConfig: clientConfig },
+        msg: 'ok',
+      },
+    });
+
+    await assert.rejects(
+      guard.request(discoveryOptions()),
+      (error) => {
+        assert.equal(error.message, 'discovery_rejected', name);
+        assert.equal(error.message.includes('MARKER'), false, name);
+        return true;
+      },
+      name,
+    );
+    assert.equal(calls.length, 1, name);
+    assert.deepEqual(records, [], name);
+  }
+});
+
+test('guard accepts the inclusive ClientConfig timer boundaries', async () => {
+  const validConfigs = [
+    { PingInterval: 1, ReconnectInterval: 1, ReconnectNonce: 0, ReconnectCount: 0 },
+    { PingInterval: 3600, ReconnectInterval: 3600, ReconnectNonce: 3600, ReconnectCount: 100 },
+    { PingInterval: 120, ReconnectInterval: 120, ReconnectNonce: 30, ReconnectCount: -1 },
+  ];
+
+  for (const clientConfig of validConfigs) {
+    const { guard } = createGuard({
+      response: {
+        code: 0,
+        data: { URL: WSS_URL, ClientConfig: clientConfig },
+        msg: 'ok',
+      },
+    });
+
+    assert.deepEqual(await guard.request(discoveryOptions()), {
+      code: 0,
+      data: { URL: WSS_URL, ClientConfig: clientConfig },
+    });
+  }
+});
+
+test('guard rejects hostile ClientConfig getters with a fixed error', async () => {
+  let reads = 0;
+  const hostileConfig = { ...CLIENT_CONFIG };
+  Object.defineProperty(hostileConfig, 'PingInterval', {
+    enumerable: true,
+    get() {
+      reads += 1;
+      if (reads > 1) {
+        throw new Error('MARKER_CLIENT_CONFIG_GETTER');
+      }
+      return 120;
+    },
+  });
+
+  const { guard } = createGuard({
+    response: {
+      code: 0,
+      data: { URL: WSS_URL, ClientConfig: hostileConfig },
+      msg: 'ok',
+    },
+  });
+
+  await assert.rejects(
+    guard.request(discoveryOptions()),
+    (error) => {
+      assert.equal(error.message, 'discovery_rejected');
+      assert.equal(error.message.includes('MARKER'), false);
+      return true;
+    },
+  );
+});
+
+test('guard strips unrelated ClientConfig and discovery data fields', async () => {
+  const { guard } = createGuard({
+    response: {
+      code: 0,
+      data: {
+        URL: WSS_URL,
+        ClientConfig: { ...CLIENT_CONFIG, PrivateTimer: 'MARKER_CLIENT_CONFIG' },
+        PrivateField: 'MARKER_DISCOVERY_DATA',
+      },
+      msg: 'MARKER_DISCOVERY_MESSAGE',
+    },
+  });
+
+  const result = await guard.request(discoveryOptions());
+
+  assert.deepEqual(result, {
+    code: 0,
+    data: { URL: WSS_URL, ClientConfig: CLIENT_CONFIG },
+  });
+  assert.equal(JSON.stringify(result).includes('MARKER'), false);
+  assert.deepEqual(Object.keys(result.data.ClientConfig).sort(), [
+    'PingInterval',
+    'ReconnectCount',
+    'ReconnectInterval',
+    'ReconnectNonce',
+  ]);
+});
+
+test('guard enforces the one-second discovery floor without sleeping', async () => {
+  let clock = 5000;
+  const { guard, calls } = createGuard({ now: () => clock });
+
+  await guard.request(discoveryOptions());
+  clock += MIN_DISCOVERY_INTERVAL_MS - 1;
+  await assert.rejects(guard.request(discoveryOptions()), fixedRejection);
+  assert.equal(calls.length, 1);
+
+  clock += 1;
+  await guard.request(discoveryOptions());
+  assert.equal(calls.length, 2);
+});
+
+test('guard caps discovery attempts per run at 32', async () => {
+  let clock = 0;
+  const { guard, calls, records } = createGuard({ now: () => clock });
+
+  for (let attempt = 0; attempt < MAX_DISCOVERY_ATTEMPTS; attempt += 1) {
+    assert.equal((await guard.request(discoveryOptions())).code, 0);
+    clock += MIN_DISCOVERY_INTERVAL_MS;
+  }
+  await assert.rejects(guard.request(discoveryOptions()), fixedRejection);
+
+  assert.equal(calls.length, MAX_DISCOVERY_ATTEMPTS);
+  assert.deepEqual(records, []);
+});
+
+test('guard confines discovery WSS URLs to the feishu.cn family on port 443', async () => {
+  const accepted = [
+    'wss://feishu.cn/ws',
+    'wss://open.feishu.cn/ws',
+    'wss://open.feishu.cn:443/ws',
+    'wss://a.b.feishu.cn/ws?device_id=synthetic-device',
+    'WSS://OPEN.FEISHU.CN/ws',
+  ];
+
+  for (const url of accepted) {
+    const { guard } = createGuard({
+      response: { code: 0, data: { URL: url, ClientConfig: CLIENT_CONFIG } },
+    });
+    const result = await guard.request(discoveryOptions());
+    assert.equal(result.data.URL, url, url);
+  }
+
+  const rejected = [
+    'wss://open.feishu.cn:8443/ws',
+    'wss://open.feishu.cn:80/ws',
+    'wss://feishu.cn.evil.example/ws',
+    'wss://evilfeishu.cn/ws',
+    'wss://open.feishu.cn.evil/ws',
+    'wss://open.larkoffice.com/ws',
+    'wss://127.0.0.1/ws',
+    'wss://10.0.0.1/ws',
+    'wss://[::1]/ws',
+  ];
+
+  for (const url of rejected) {
+    const { guard , records } = createGuard({
+      response: { code: 0, data: { URL: url, ClientConfig: CLIENT_CONFIG } },
+    });
+    await assert.rejects(
+      guard.request(discoveryOptions()),
+      (error) => {
+        assert.equal(error.message, 'discovery_rejected', url);
+        assert.equal(error.message.includes(url), false, url);
+        return true;
+      },
+      url,
+    );
+    assert.deepEqual(records, [], url);
+  }
 });
 
 test('guard rejects wrong methods, non-discovery URLs, and alternate auth bodies before the request', async () => {

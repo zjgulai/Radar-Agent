@@ -74,10 +74,21 @@ class CredentialLookupTests(unittest.TestCase):
                 'ok = value.get("appSecret") == "synthetic-test-only"\n'
                 'ok = ok and value.get("durationSeconds") == 10\n'
                 'ok = ok and "FEISHU_APP_SECRET" not in os.environ\n'
+                'ok = ok and "NODE_OPTIONS" not in os.environ\n'
+                'ok = ok and "NODE_TLS_REJECT_UNAUTHORIZED" not in os.environ\n'
+                'ok = ok and "HTTPS_PROXY" not in os.environ\n'
+                'ok = ok and "HTTP_PROXY" not in os.environ\n'
                 'ok = ok and "synthetic-test-only" not in " ".join(sys.argv)\n'
                 'raise SystemExit(0 if ok else 9)\n', encoding='utf-8')
-            old = os.environ.get('FEISHU_APP_SECRET')
-            os.environ['FEISHU_APP_SECRET'] = 'synthetic-other-app-value'
+            synthetic_environment = {
+                'FEISHU_APP_SECRET': 'synthetic-other-app-value',
+                'NODE_OPTIONS': '--require synthetic-preload',
+                'NODE_TLS_REJECT_UNAUTHORIZED': '0',
+                'HTTPS_PROXY': 'http://synthetic-proxy.invalid',
+                'HTTP_PROXY': 'http://synthetic-proxy.invalid',
+            }
+            saved = {name: os.environ.get(name) for name in synthetic_environment}
+            os.environ.update(synthetic_environment)
             try:
                 import sys
                 result = launcher.run_child(
@@ -85,10 +96,11 @@ class CredentialLookupTests(unittest.TestCase):
                     child, duration_seconds=10, executable=sys.executable)
                 self.assertEqual(result, 0)
             finally:
-                if old is None:
-                    os.environ.pop('FEISHU_APP_SECRET', None)
-                else:
-                    os.environ['FEISHU_APP_SECRET'] = old
+                for name, value in saved.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
 
 
 class BoundedTranscriptTests(unittest.TestCase):
@@ -215,11 +227,17 @@ class ChildProcessLifecycleTests(unittest.TestCase):
                 directory,
                 lambda timeout: subprocess.TimeoutExpired(
                     cmd=['synthetic-child'], timeout=timeout))
-            self.assertEqual(seen['timeout'], 35)
+            self.assertEqual(seen['timeout'], 40)
             self.assertIsInstance(raised, TimeoutError)
             self.assertEqual(str(raised), 'child_process_timeout')
             self.assertNotIn('synthetic-child', str(raised))
             self.assert_process_dead(pid_path)
+
+    def test_startup_budget_tracks_runtime_deadline_with_margin(self):
+        # 25s startup (20s runtime discovery+handshake plus 5s margin) and 10s cleanup.
+        self.assertEqual(launcher.CHILD_STARTUP_SECONDS, 25)
+        self.assertEqual(
+            launcher.CHILD_STARTUP_SECONDS + launcher.CHILD_CLEANUP_SECONDS, 35)
 
     def test_keyboard_interrupt_reaps_child_and_reraises(self):
         with tempfile.TemporaryDirectory() as directory:
